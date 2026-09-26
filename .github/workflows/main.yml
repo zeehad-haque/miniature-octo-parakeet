@@ -1,0 +1,477 @@
+name: Secure RDP + Runner Speed Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2025
+    timeout-minutes: 350
+
+    steps:
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tsVersion = '1.102.3'
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$tsVersion-amd64.msi"
+          $installerPath = Join-Path $env:TEMP "tailscale-$tsVersion-amd64.msi"
+
+          Write-Host "Downloading Tailscale $tsVersion..."
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+          Write-Host "Installing Tailscale..."
+          Start-Process msiexec.exe `
+            -ArgumentList @('/i', $installerPath, '/quiet', '/norestart') `
+            -Wait
+
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tsExe)) {
+            throw "Tailscale executable was not found at $tsExe"
+          }
+
+          Write-Host "Tailscale version:"
+          & $tsExe version
+
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "TAILSCALE_AUTH_KEY GitHub Secret is missing."
+          }
+
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+
+          Write-Host "Connecting Tailscale..."
+          & $tsExe up `
+            --authkey=$env:TS_AUTHKEY `
+            --hostname=$hostname `
+            --unattended=true
+
+          $tsIP = $null
+
+          for ($i = 1; $i -le 20; $i++) {
+            $candidate = (& $tsExe ip -4 2>$null | Select-Object -First 1)
+
+            if ($candidate) {
+              $candidate = $candidate.ToString().Trim()
+
+              if ($candidate -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                $tsIP = $candidate
+                break
+              }
+            }
+
+            Write-Host "Waiting for Tailscale IP... attempt $i/20"
+            Start-Sleep -Seconds 3
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Tailscale IPv4 address was not assigned."
+            & $tsExe status
+            exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
+
+          Write-Host ""
+          Write-Host "=== TAILSCALE ==="
+          Write-Host "Hostname: $hostname"
+          Write-Host "IPv4:     $tsIP"
+          Write-Host "================="
+
+          & $tsExe status
+
+      - name: Configure Remote Desktop
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD GitHub Secret is missing."
+          }
+
+          # GitHub's standard Windows runner normally executes
+          # the workflow under the runner's local account.
+          $rdpUser = $env:USERNAME
+
+          Write-Host "Detected runner account: $rdpUser"
+
+          $localUser = Get-LocalUser -Name $rdpUser -ErrorAction SilentlyContinue
+
+          if (-not $localUser) {
+            throw "Local runner user '$rdpUser' was not found."
+          }
+
+          # Set the existing runner account password from GitHub Secret.
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          Set-LocalUser `
+            -Name $rdpUser `
+            -Password $securePassword `
+            -PasswordNeverExpires $true
+
+          # Add the existing runner account to Remote Desktop Users.
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $rdpUser `
+            -ErrorAction SilentlyContinue
+
+          # Enable Remote Desktop.
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0 `
+            -Force
+
+          # Disable NLA for maximum compatibility with this temporary runner.
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 0 `
+            -Force
+
+          # Use the RDP security layer instead of forcing NLA.
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' `
+            -Value 0 `
+            -Force
+
+          # Make sure RDP listens on the standard port.
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'PortNumber' `
+            -Value 3389 `
+            -Force
+
+          # Make sure all adapters are allowed.
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'LanAdapter' `
+            -Value 0 `
+            -Force
+
+          # Restart Remote Desktop service.
+          Set-Service `
+            -Name TermService `
+            -StartupType Automatic
+
+          Restart-Service `
+            -Name TermService `
+            -Force
+
+          Start-Sleep -Seconds 3
+
+          # Remove previous temporary firewall rules.
+          Get-NetFirewallRule `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.DisplayName -like 'RDP-Tailscale*'
+            } |
+            Remove-NetFirewallRule `
+              -ErrorAction SilentlyContinue
+
+          # Find the Tailscale network adapter.
+          $tsAdapter = Get-NetAdapter |
+            Where-Object {
+              $_.Status -eq 'Up' -and (
+                $_.Name -like '*Tailscale*' -or
+                $_.InterfaceDescription -like '*Tailscale*'
+              )
+            } |
+            Select-Object -First 1
+
+          if (-not $tsAdapter) {
+            Write-Host "Available network adapters:"
+            Get-NetAdapter | Format-Table -AutoSize
+            throw "Tailscale network adapter was not found."
+          }
+
+          Write-Host "Tailscale adapter: $($tsAdapter.Name)"
+
+          # Allow RDP ONLY from the Tailscale address space
+          # and ONLY through the Tailscale adapter.
+          New-NetFirewallRule `
+            -DisplayName 'RDP-Tailscale-TCP' `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -InterfaceAlias $tsAdapter.Name `
+            -RemoteAddress '100.64.0.0/10' `
+            -Profile Any
+
+          # UDP is useful for RDP performance when available.
+          New-NetFirewallRule `
+            -DisplayName 'RDP-Tailscale-UDP' `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol UDP `
+            -LocalPort 3389 `
+            -InterfaceAlias $tsAdapter.Name `
+            -RemoteAddress '100.64.0.0/10' `
+            -Profile Any
+
+          Write-Host ""
+          Write-Host "=== RDP CONFIGURATION ==="
+
+          $termService = Get-Service -Name TermService
+
+          Write-Host "TermService status: $($termService.Status)"
+          Write-Host "TermService startup: $($termService.StartType)"
+
+          if ($termService.Status -ne 'Running') {
+            throw "TermService is not running."
+          }
+
+          $listen = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $listen) {
+            throw "TCP 3389 is not listening."
+          }
+
+          Write-Host ""
+          Write-Host "TCP 3389 LISTENING:"
+          $listen |
+            Select-Object LocalAddress, LocalPort, State |
+            Format-Table -AutoSize
+
+          Write-Host ""
+          Write-Host "Remote Desktop Users:"
+          Get-LocalGroupMember `
+            -Group "Remote Desktop Users" |
+            Format-Table -AutoSize
+
+          Write-Host ""
+          Write-Host "RDP configuration completed."
+
+          "RDP_USER=$rdpUser" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
+
+      - name: Verify RDP Listener
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host ""
+          Write-Host "=== RDP LISTENER TEST ==="
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Port: 3389"
+
+          $test = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          Write-Host "TcpTestSucceeded: $($test.TcpTestSucceeded)"
+
+          if (-not $test.TcpTestSucceeded) {
+            throw "Local TCP 3389 test failed."
+          }
+
+          Write-Host "Local RDP listener test: PASS"
+          Write-Host ""
+          Write-Host "NOTE: This test is from the runner to itself."
+          Write-Host "Your PC must independently test Tailscale -> runner connectivity."
+
+      - name: Measure Runner Internet Speed
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $speedVersion = '1.2.0'
+          $speedUrl = "https://install.speedtest.net/app/cli/ookla-speedtest-$speedVersion-win64.zip"
+          $expectedSha256 = '13E3D888B845D301A556419E31F14AB9BFF57E3F06089EF2FD3BDC9BA6841EFA'
+
+          $speedDir = Join-Path $env:TEMP 'ookla-speedtest'
+          $zipPath = Join-Path $env:TEMP 'ookla-speedtest.zip'
+
+          Remove-Item $speedDir -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+
+          New-Item `
+            -ItemType Directory `
+            -Path $speedDir `
+            -Force |
+            Out-Null
+
+          Write-Host ""
+          Write-Host "=== RUNNER INTERNET SPEED TEST ==="
+          Write-Host "Downloading official Ookla Speedtest CLI..."
+
+          Invoke-WebRequest `
+            -Uri $speedUrl `
+            -OutFile $zipPath
+
+          $actualSha256 = (
+            Get-FileHash `
+              -Path $zipPath `
+              -Algorithm SHA256
+          ).Hash.ToUpper()
+
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "Speedtest ZIP SHA256 mismatch."
+          }
+
+          Expand-Archive `
+            -Path $zipPath `
+            -DestinationPath $speedDir `
+            -Force
+
+          $speedExe = Join-Path $speedDir 'speedtest.exe'
+
+          if (-not (Test-Path $speedExe)) {
+            throw "speedtest.exe was not found."
+          }
+
+          Write-Host "Running Speedtest..."
+          Write-Host ""
+
+          $raw = & $speedExe `
+            --accept-license `
+            --accept-gdpr `
+            --progress=no `
+            --format=json 2>&1
+
+          if ($LASTEXITCODE -ne 0) {
+            $raw | ForEach-Object { Write-Host $_ }
+            throw "Speedtest CLI failed with exit code $LASTEXITCODE."
+          }
+
+          $jsonText = ($raw | Out-String).Trim()
+
+          try {
+            $result = $jsonText | ConvertFrom-Json
+          }
+          catch {
+            Write-Host "Raw Speedtest output:"
+            Write-Host $jsonText
+            throw "Could not parse Speedtest JSON output."
+          }
+
+          $downloadMbps = [math]::Round(
+            ([double]$result.download.bandwidth * 8) / 1000000,
+            2
+          )
+
+          $uploadMbps = [math]::Round(
+            ([double]$result.upload.bandwidth * 8) / 1000000,
+            2
+          )
+
+          $downloadGbps = [math]::Round(
+            $downloadMbps / 1000,
+            3
+          )
+
+          $uploadGbps = [math]::Round(
+            $uploadMbps / 1000,
+            3
+          )
+
+          $pingMs = [math]::Round(
+            [double]$result.ping.latency,
+            2
+          )
+
+          Write-Host "===================================="
+          Write-Host "      ACTUAL RUNNER SPEED TEST"
+          Write-Host "===================================="
+          Write-Host "ISP:        $($result.isp)"
+          Write-Host "Server:     $($result.server.name)"
+          Write-Host "Location:   $($result.server.location)"
+          Write-Host "Ping:       $pingMs ms"
+          Write-Host "Download:   $downloadMbps Mbps"
+          Write-Host "Download:   $downloadGbps Gbps"
+          Write-Host "Upload:     $uploadMbps Mbps"
+          Write-Host "Upload:     $uploadGbps Gbps"
+          Write-Host "Packet loss:$($result.packetLoss)%"
+          Write-Host "===================================="
+
+          try {
+            $publicIP = (Invoke-RestMethod 'https://api.ipify.org').ToString().Trim()
+            Write-Host "Runner public IPv4: $publicIP"
+          }
+          catch {
+            Write-Host "Could not determine runner public IPv4."
+          }
+
+          Write-Host ""
+          Write-Host "These values are measured on the GitHub-hosted runner itself."
+
+      - name: Show RDP Access Details
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "             RDP ACCESS"
+          Write-Host "========================================"
+          Write-Host "Address:  $env:TAILSCALE_IP"
+          Write-Host "Username: .\$env:RDP_USER"
+          Write-Host "Password: stored only in GitHub Secret"
+          Write-Host ""
+          Write-Host "From your Windows PC run:"
+          Write-Host "mstsc /v:$env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "Do NOT expect the password to appear in this log."
+          Write-Host "========================================"
+
+      - name: Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "RDP Active."
+          Write-Host "The runner will remain available until:"
+          Write-Host "1) You cancel the workflow, or"
+          Write-Host "2) GitHub reaches the maximum job duration."
+          Write-Host ""
+
+          while ($true) {
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP/Tailscale session active."
+            Start-Sleep -Seconds 300
+          }
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+
+          Write-Host "Cleaning temporary RDP/Tailscale configuration..."
+
+          Get-NetFirewallRule |
+            Where-Object {
+              $_.DisplayName -like 'RDP-Tailscale*'
+            } |
+            Remove-NetFirewallRule
+
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (Test-Path $tsExe) {
+            & $tsExe logout
+          }
+
+          Write-Host "Cleanup complete."
